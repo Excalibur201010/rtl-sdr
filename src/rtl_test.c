@@ -53,23 +53,6 @@
 #define PPM_DURATION			10
 #define PPM_DUMP_TIME			5
 
-#define SCAN_LIMIT			2500000000
-
-struct time_generic
-/* holds all the platform specific values */
-{
-#ifndef _WIN32
-	time_t tv_sec;
-	long tv_nsec;
-#else
-	long tv_sec;
-	long tv_nsec;
-	int init;
-	LARGE_INTEGER frequency;
-	LARGE_INTEGER ticks;
-#endif
-};
-
 static enum {
 	NO_BENCHMARK,
 	TUNER_BENCHMARK,
@@ -93,8 +76,10 @@ void usage(void)
 		"Usage:\n"
 		"\t[-s samplerate (default: 2048000 Hz)]\n"
 		"\t[-d device_index (default: 0)]\n"
-		"\t[-t enable tuner range benchmark]\n"
+		"\t[-t enable E4000 or R820T tuner range benchmark]\n"
+#ifndef _WIN32
 		"\t[-p[seconds] enable PPM error measurement (default: 10 seconds)]\n"
+#endif
 		"\t[-b output_block_size (default: 16 * 16384)]\n"
 		"\t[-S force sync output (default: async)]\n");
 	exit(1);
@@ -149,42 +134,21 @@ static void underrun_test(unsigned char *buf, uint32_t len, int mute)
 }
 
 #ifndef _WIN32
-static int ppm_gettime(struct time_generic *tg)
+static int ppm_gettime(struct timespec *ts)
 {
 	int rv = ENOSYS;
-	struct timespec ts;
 
 #ifdef __unix__
-	rv = clock_gettime(CLOCK_MONOTONIC, &ts);
-	tg->tv_sec = ts.tv_sec;
-	tg->tv_nsec = ts.tv_nsec;
+	rv = clock_gettime(CLOCK_MONOTONIC, ts);
 #elif __APPLE__
 	struct timeval tv;
 
 	rv = gettimeofday(&tv, NULL);
-	ts.tv_sec = tv.tv_sec;
-	ts.tv_nsec = tv.tv_usec * 1000;
+	ts->tv_sec = tv.tv_sec;
+	ts->tv_nsec = tv.tv_usec * 1000;
 #endif
 	return rv;
 }
-#endif
-
-#ifdef _WIN32
-static int ppm_gettime(struct time_generic *tg)
-{
-	int rv;
-	int64_t frac;
-	if (!tg->init) {
-		QueryPerformanceFrequency(&tg->frequency);
-		tg->init = 1;
-	}
-	rv = QueryPerformanceCounter(&tg->ticks);
-	tg->tv_sec = tg->ticks.QuadPart / tg->frequency.QuadPart;
-	frac = (int64_t)(tg->ticks.QuadPart - (tg->tv_sec * tg->frequency.QuadPart));
-	tg->tv_nsec = (long)(frac * 1000000000L / (int64_t)tg->frequency.QuadPart);
-	return !rv;
-}
-#endif
 
 static int ppm_report(uint64_t nsamples, uint64_t interval)
 {
@@ -201,9 +165,8 @@ static void ppm_test(uint32_t len)
 	static uint64_t interval = 0;
 	static uint64_t nsamples_total = 0;
 	static uint64_t interval_total = 0;
-	static struct time_generic ppm_now;
-	static struct time_generic ppm_recent;
-
+	struct timespec ppm_now;
+	static struct timespec ppm_recent;
 	static enum {
 		PPM_INIT_NO,
 		PPM_INIT_DUMP,
@@ -211,7 +174,6 @@ static void ppm_test(uint32_t len)
 	} ppm_init = PPM_INIT_NO;
 
 	ppm_gettime(&ppm_now);
-
 	if (ppm_init != PPM_INIT_RUN) {
 		/*
 		 * Kyle Keen wrote:
@@ -227,7 +189,8 @@ static void ppm_test(uint32_t len)
 		}
 		if (ppm_init == PPM_INIT_DUMP && ppm_recent.tv_sec < ppm_now.tv_sec)
 			return;
-		ppm_recent = ppm_now;
+		ppm_recent.tv_sec = ppm_now.tv_sec;
+		ppm_recent.tv_nsec = ppm_now.tv_nsec;
 		ppm_init = PPM_INIT_RUN;
 		return;
 	}
@@ -237,25 +200,28 @@ static void ppm_test(uint32_t len)
 		return;
 	interval *= 1000000000UL;
 	interval += (int64_t)(ppm_now.tv_nsec - ppm_recent.tv_nsec);
-
 	nsamples_total += nsamples;
 	interval_total += interval;
 	printf("real sample rate: %i current PPM: %i cumulative PPM: %i\n",
 		(int)((1000000000UL * nsamples) / interval),
 		ppm_report(nsamples, interval),
 		ppm_report(nsamples_total, interval_total));
-	ppm_recent = ppm_now;
+	ppm_recent.tv_sec = ppm_now.tv_sec;
+	ppm_recent.tv_nsec = ppm_now.tv_nsec;
 	nsamples = 0;
 }
+#endif
 
 static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 {
 	underrun_test(buf, len, 0);
+#ifndef _WIN32
 	if (test_mode == PPM_BENCHMARK)
 		ppm_test(len);
+#endif
 }
 
-/* smallest band or band gap that tuner_benchmark() will notice */
+/* Controls the smallest band or band gap that tuner_benchmark() will notice */
 static uint32_t max_step(uint32_t freq) {
 	if (freq < 1e6)
 		return 1e4;
@@ -264,83 +230,146 @@ static uint32_t max_step(uint32_t freq) {
 	return freq / 1e2;
 }
 
-/* precision with which tuner_benchmark() will measure the edges of bands */
+/* Controls the precision with which tuner_benchmark() will measure the edges of tuning bands */
 static uint32_t min_step(uint32_t freq) {
 	return 100;
 }
 
-int confirm_pll_lock(uint32_t f)
-{
-	int i;
-	for (i=0; i<20; i++) {
-		if (rtlsdr_set_center_freq(dev, f) >= 0)
-			return 1;
-	}
-	return 0;
+static void report_band_start(uint32_t start) {
+	fprintf(stderr, "Found a new band starting at %u Hz\n", start);
 }
 
-/* returns last frequency before achieving status of 'lock' */
-uint32_t coarse_search(uint32_t start, int lock)
-{
-	uint32_t f = start, f2;
-	int status;
-	while (f < SCAN_LIMIT) {
-		if (do_exit)
-			break;
-		f2 = f + max_step(f);
-		status = rtlsdr_set_center_freq(dev, f2) >= 0;
-		if (!lock && !status)
-			status = confirm_pll_lock(f2);
-		if (status == lock)
-			return f;
-		f = f2;
-	}
-	return SCAN_LIMIT + 1;
-}
-
-/* returns frequency of a transition
- * must have one transition between start and start+step */
-uint32_t fine_search(uint32_t start, uint32_t step)
-{
-	int low_status, mid_status, high_status;
-	uint32_t f, stop;
-	stop = start + step;
-	f = start + step / 2;
-	low_status = rtlsdr_set_center_freq(dev, start) >= 0;
-	high_status = rtlsdr_set_center_freq(dev, stop) >= 0;
-	if (low_status == high_status)
-		return start;
-	while (step > min_step(start)) {
-		if (do_exit)
-			break;
-		mid_status = rtlsdr_set_center_freq(dev, f) >= 0;
-		if (low_status == mid_status)
-			start = f;
-		else
-			stop = f;
-		step = stop - start;
-		f = start + step / 2;
-	}
-	return f;
+static void report_band(uint32_t low, uint32_t high) {
+	fprintf(stderr, "Tuning band: %u - %u Hz\n", low, high);
 }
 
 void tuner_benchmark(void)
 {
-	uint32_t f = 0, low_bound, high_bound;
-	fprintf(stderr, "Testing tuner range. This may take a couple of minutes...\n");
-	while (!do_exit) {
-		/* find start of a band */
-		f = coarse_search(f, 1);
-		low_bound = fine_search(f, max_step(f));
-		f += max_step(f);
-		/* find stop of a band */
-		f = coarse_search(f, 0);
-		high_bound = fine_search(f, max_step(f));
-		f += max_step(f);
-		if (f > SCAN_LIMIT)
-			break;
-		fprintf(stderr, "Band: %u - %u Hz\n", low_bound, high_bound);
+	uint32_t current = max_step(0);
+	uint32_t band_start = 0;
+	uint32_t low_bound = 0, high_bound = 0;
+	char buf[20];
+	enum { FIND_START, REFINE_START, FIND_END, REFINE_END } state;
+
+	fprintf(stderr, "Testing tuner range. This may take a couple of minutes..\n");
+
+	/* Scan for tuneable frequencies coarsely. When we find something,
+	 * do a binary search to narrow down the exact edge of the band.
+	 *
+	 * This can potentially miss bands or band gaps that are smaller than max_step(freq)
+	 * but it is a lot faster than exhaustively scanning everything.
+	 */
+
+	/* handle bands starting at 0Hz */
+	if (rtlsdr_set_center_freq(dev, 0) < 0)
+		state = FIND_START;
+	else {
+		band_start = 0;
+		report_band_start(band_start);
+		state = FIND_END;
 	}
+
+	while (current < 3e9 && !do_exit) {
+		switch (state) {
+		case FIND_START:
+			/* scanning for the start of a new band */
+			if (rtlsdr_set_center_freq(dev, current) < 0) {
+				/* still looking for a band */
+				low_bound = current;
+				current += max_step(current);
+			} else {
+				/* new band, starting somewhere at or before current */
+				/* low_bound < start <= current, refine it */
+				high_bound = current;
+				state = REFINE_START;
+			}
+			break;
+
+		case REFINE_START:
+			/* refining the start of a band */
+			/* low_bound < bandstart <= high_bound */
+			if (rtlsdr_set_center_freq(dev, current) == 0) {
+				/* current is inside the band */
+				/* low_bound < bandstart <= current */
+				if (current - low_bound <= min_step(current)) {
+					/* close enough. Say the band starts at current and go looking for the end of it. */
+					band_start = current;
+					report_band_start(band_start);
+					low_bound = current;
+					state = FIND_END;
+				} else {
+					/* try halfway between low_bound and current */
+					high_bound = current;
+					current = (current + low_bound) / 2;
+				}
+			} else {
+				/* current is outside the band */
+				/* current < bandstart <= high_bound */
+				if (high_bound - current <= min_step(current)) {
+					/* close enough. Say the band starts at high_bound and go looking for the end of it. */
+					current = low_bound = band_start = high_bound;
+					report_band_start(band_start);
+					state = FIND_END;
+				} else {
+					/* try halfway betwen current and high_bound */
+					low_bound = current;
+					current = (current + high_bound) / 2;
+				}
+			}
+			break;
+
+		case FIND_END:
+			/* scanning for the end of the current band */
+			if (rtlsdr_set_center_freq(dev, current) == 0) {
+				/* still looking for the end of the band */
+				low_bound = current;
+				current += max_step(current);
+			} else {
+				/* ran off the end of the band somewhere before current */
+				/* low_bound <= bandend < current, refine it */
+				high_bound = current;
+				state = REFINE_END;
+			}
+			break;
+
+		case REFINE_END:
+			/* refining the end of a band */
+			/* low_bound <= bandend < high_bound */
+			if (rtlsdr_set_center_freq(dev, current) < 0) {
+				/* current is outside the band */
+				/* low_bound <= bandend < current */
+				if (current - low_bound <= min_step(current)) {
+					/* close enough. Say the band ends at low_bound and go looking for another band. */
+					report_band(band_start, low_bound);
+					low_bound = current;
+					state = FIND_START;
+				} else {
+					/* try halfway between low_bound and current */
+					high_bound = current;
+					current = (current + low_bound) / 2;
+				}
+			} else {
+				/* current is inside the band */
+				/* current <= bandend < high_bound */
+				if (high_bound - current <= min_step(current)) {
+					/* close enough. Say the band ends at current and go looking for another band. */
+					report_band(band_start, current);
+					current = low_bound = high_bound;
+					state = FIND_START;
+				} else {
+					/* try halfway betwen current and high_bound */
+					low_bound = current;
+					current = (current + high_bound) / 2;
+				}
+			}
+			break;
+		}
+	}
+
+	if (state == FIND_END)
+		report_band(band_start, current);
+	else if (state == REFINE_END)
+		report_band(band_start, low_bound);
 }
 
 int main(int argc, char **argv)
@@ -447,7 +476,7 @@ int main(int argc, char **argv)
 	verbose_reset_buffer(dev);
 
 	if ((test_mode == PPM_BENCHMARK) && !sync_mode) {
-		fprintf(stderr, "Reporting PPM error measurement every %u seconds...\n", ppm_duration);
+		fprintf(stderr, "Reporting PPM error measurement every %i seconds...\n", ppm_duration);
 		fprintf(stderr, "Press ^C after a few minutes.\n");
 	}
 

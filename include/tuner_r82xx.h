@@ -42,10 +42,6 @@
 
 #define VER_NUM			49
 
-/* R820T Clock */
-#define CALIBRATION_LO 88000
-
-
 enum r82xx_chip {
 	CHIP_R820T,
 	CHIP_R620D,
@@ -86,11 +82,7 @@ struct r82xx_priv {
 	uint16_t			pll;	/* kHz */
 	uint32_t			int_freq;
 	uint8_t				fil_cal_code;
-	uint8_t				filt;
-	uint8_t				hpf;
 	uint8_t				input;
-	uint32_t			freq;
-	int				has_lock;
 	int				init_done;
 	int				disable_dither;
 	int				reg_cache;
@@ -101,6 +93,13 @@ struct r82xx_priv {
 	enum r82xx_tuner_type		type;
 
 	uint32_t			bw;	/* in MHz */
+	uint32_t			if_filter_freq;	/* in Hz */
+
+	int pll_off;
+
+	/* current PLL limits */
+	uint32_t pll_low_limit;
+	uint32_t pll_high_limit;
 
 	void *rtl_dev;
 };
@@ -124,11 +123,10 @@ enum r82xx_delivery_system {
 
 int r82xx_standby(struct r82xx_priv *priv);
 int r82xx_init(struct r82xx_priv *priv);
-int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq);
+int r82xx_set_freq(struct r82xx_priv *priv, uint32_t freq, uint32_t *lo_freq_out);
 int r82xx_set_gain(struct r82xx_priv *priv, int set_manual_gain, int gain);
 int r82xx_set_nomod(struct r82xx_priv *priv);
 int r82xx_set_dither(struct r82xx_priv *priv, int dither);
 int r82xx_set_bw(struct r82xx_priv *priv, uint32_t bw);
-int r82xx_set_if_freq(struct r82xx_priv *priv, uint32_t freq);
 
 #endif
